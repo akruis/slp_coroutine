@@ -1,0 +1,10 @@
+*.orig
+*.pyc
+*.pyd
+*.pyo
+*.rej
+*~
+.project
+.pydevproject
+dist/
+build/
