@@ -1,4 +1,4 @@
-# Use plain old callables as coroutines using Stackless Python
+# Use normal callables as coroutines using Stackless Python
 # Copyright (c) 2021  Anselm Kruis
 #
 # This library is free software; you can redistribute it and/or modify it under the
@@ -17,43 +17,78 @@
 
 
 '''
-A prove of concept for adapting plain old callables to asyncio using Stackless Python
+Adapt normal functions, methods and other callables to asyncio using Stackless Python
 
-Limitations of this demo code:
+Requires Stackless Python >= 3.7.6
 
-   - Requires Stackless Python >= 3.7.6
+This module provides adapters and decorators to use "normal" Python code
+to write tasks of an asyncio-application. This way many libraries, which do not
+support asyncio can be used with this framework.
 
+In Python the difference between a *normal function* and a *coroutine function* is, that the coroutine
+function needs a controller, which executes the coroutine step by step, whereas the normal function executes
+in a single non-interruptible pass. If the coroutine needs to wait for an event (i.e. data input),
+its controller can run other code, until the event happens. A normal function usually has no choice but to block.
+
+With *Stackless Python* it is possible to execute multiple functions in parallel on a single thread.
+Each execution context is called a *tasklet*. If a function has to wait for an event, it can - instead of blocking -
+switch the execution to another tasklet. This switching capability makes it possible to invoke a normal callable
+from a coroutine and to await coroutines from within the normal callable. This technique can be extended
+to (asynchronous) generators and decorators.
 '''
 
 import sys
-import stackless
 import collections.abc
 import functools
 import types
-import contextvars
+import threading
+import contextlib
+import stackless
+
 
 __all__ = ('new_generator_coroutine', 'as_coroutinefunction', 'new_coroutine', 'await_coroutine', 'generator', 'async_generator')
 
+_AWAIT = object()  # sentinel
 
-class TaskletStopIteration(StopIteration):
+class _TaskletStopIteration(StopIteration):
+    """Signal the end of a tasklet and encapsulate the return value of the tasklet"""
     pass
 
 def _run(args):
+    # utility function for new_generator_coroutine()
     # The args.pop() trick removes any arguments from this stack frame. This way any non-pickleable
     # object does not hurt.
-    raise TaskletStopIteration(args.pop()(*args.pop(), **args.pop()))
+    raise _TaskletStopIteration(args.pop()(*args.pop(), **args.pop()))
 
-_is_as_coroutine_tasklet = contextvars.ContextVar('is_as_coroutine_tasklet', default=False)
-
-def _run_as_coroutine_tasklet():
-    token = _is_as_coroutine_tasklet.set(True)
-    try:
-        return stackless.run()
-    finally:
-        _is_as_coroutine_tasklet.reset(token)
+# This thread local variable counts, how many times the Stackless scheduler (stackless.run()) has been
+# recursively entered by new_generator_coroutine()
+class _ThreadLocalRunCount(threading.local):
+    runcount = 0
+_new_generator_coroutine = _ThreadLocalRunCount()
 
 @types.coroutine
 def new_generator_coroutine(callable_, *args, **kwargs):
+    """Run any Python callable as generator-based coroutine.
+
+    The coroutine-function :func:`new_generator_coroutine` returns a new
+    coroutine, that executes *callable_* in a new tasklet.
+    *callable_* may await other coroutines or switch tasklets. Details:
+
+    * If the tasklet yields (i.e. calls :func:`stackless.schedule`)
+      the generator-coroutine returned by :func:`new_generator_coroutine` yields `tasklet.tempval`.
+    * If the tasklet awaits another coroutine (calls :func:`await_coroutine`), the generator-coroutine
+      returned by :func:`new_generator_coroutine` controls the awaited coroutine.
+    * If you send a value or an exception to the generator-coroutine returned by :func:`new_generator_coroutine`,
+      it passes the value or exception to the tasklet or, if the tasklet is awaiting a coroutine,
+      to the currently awaited coroutine.
+    * The returned coroutine returns the return value of ``callable(*args, **kwargs)``.
+    * The returned coroutine is generator based. See :func:`types.coroutine`.
+
+    :param Callable callable_: the callable to be executed
+    :param args: positional arguments for *callable_*
+    :param kwargs: keyword arguments for *callable_*
+    :returns: a generator-based coroutine that executes ``callable(*args, **kwargs)``
+    """
     tasklet = stackless.tasklet(_run)([kwargs, args, callable_])
     del callable_
     del args
@@ -67,13 +102,18 @@ def new_generator_coroutine(callable_, *args, **kwargs):
         if wait_for is not None:
             assert tasklet.paused
             try:
-                if exception is None:
-                    value = tasklet.context_run(wait_for.send, value)
-                else:
-                    try:
-                        value = tasklet.context_run(wait_for.throw, *exception)
-                    finally:
-                        exception = None
+                rc = _new_generator_coroutine.runcount
+                _new_generator_coroutine.runcount = 0
+                try:
+                    if exception is None:
+                        value = tasklet.context_run(wait_for.send, value)
+                    else:
+                        try:
+                            value = tasklet.context_run(wait_for.throw, *exception)
+                        finally:
+                            exception = None
+                finally:
+                    _new_generator_coroutine.runcount = rc
             except StopIteration as ex:
                 wait_for = None
                 value = ex.value
@@ -103,12 +143,12 @@ def new_generator_coroutine(callable_, *args, **kwargs):
                         tasklet.throw(*exception, pending=True)
                     finally:
                         exception = None
-                
-                # Usually tasklet shares the context with the current tasklet, but this is not the case,
-                # if the current tasklet has no context, or if tasklet changes the context.
-                # Therefore we run the stackless scheduler in the context of tasklet
-                tasklet.context_run(_run_as_coroutine_tasklet)
-            except TaskletStopIteration as ex:
+                _new_generator_coroutine.runcount += 1
+                try:
+                    stackless.run()
+                finally:
+                    _new_generator_coroutine.runcount -= 1
+            except _TaskletStopIteration as ex:
                 return ex.value
             except StopIteration as ex:
                 # special case: a generator must not raise StopIteration.
@@ -123,7 +163,7 @@ def new_generator_coroutine(callable_, *args, **kwargs):
                 value = None
 
             # test, if tasklet called await_coroutine(...) 
-            if isinstance(value, tuple) and len(value) == 2 and value[0] == "await":
+            if isinstance(value, tuple) and len(value) == 2 and value[0] is _AWAIT:
                 assert tasklet.paused
                 wait_for = value[1]
                 value = None
@@ -145,9 +185,23 @@ def new_generator_coroutine(callable_, *args, **kwargs):
             exception = sys.exc_info()
             value = None
 
+
 def generator(asyncgen):
+    """Create a generator-iterator, that iterates over *asyncgen*
+
+    This generator-function creates a generator-iterator, that iterates
+    over the given asynchronous iterable.
+
+    The returned generator-iterator must be called from code, that is executed
+    by :func:`new_generator_coroutine`.
+
+    :param asyncgen: an asynchronous iterable object
+    :returns: a generator iterator
+    :raises RuntimeError: the generator raises RuntimeError, if called from outside of
+       :func:`new_generator_coroutine`.
+    """
     # See Python language reference 8.8.2. The async for statement
-    if not _is_as_coroutine_tasklet.get():
+    if not _new_generator_coroutine.runcount:
         raise RuntimeError("Can't call generator() from tasklet " + repr(stackless.current))
     asyncgen = type(asyncgen).__aiter__(asyncgen)
     cls = type(asyncgen)
@@ -156,7 +210,7 @@ def generator(asyncgen):
     value = ()
     while True:
         try:
-            value = stackless.schedule_remove(("await", method(asyncgen, *value)))
+            value = stackless.schedule_remove((_AWAIT, method(asyncgen, *value)))
         except StopAsyncIteration:
             return
         try:
@@ -164,7 +218,7 @@ def generator(asyncgen):
             method = cls.asend
         except GeneratorExit:
             try:
-                stackless.schedule_remove(("await", cls.aclose(asyncgen)))
+                stackless.schedule_remove((_AWAIT, cls.aclose(asyncgen)))
             except StopAsyncIteration:
                 pass
             raise
@@ -174,6 +228,14 @@ def generator(asyncgen):
 
 
 async def async_generator(generator):
+    """Create an asynchronous generator iterator, that iterates over *generator*
+
+    This generator-function creates a asynchronous generator iterator, that iterates
+    over the given generator or iterator.
+
+    :param generator: a generator or iterator object
+    :returns: an asynchronous generator iterator
+    """
     value = None
     exception = None
     while True:
@@ -210,30 +272,57 @@ async def async_generator(generator):
 
 
 class contextmanager:
+    """A context manager, that delegates to an asynchronous context manager.
+
+    This *with* statement context manager delegates to an asynchronous context manager
+    to actually manage the context.
+    """
     def __init__(self, async_contextmanager):
+        """
+        :param async_contextmanager: the asynchronous context manager to delegate to
+        """
         self.async_contextmanager = async_contextmanager
-        
+
     def __enter__(self):
         return await_coroutine(type(self.async_contextmanager).__aenter__(self.async_contextmanager))
-    
+
     def __exit__(self, exc_type, exc_value, traceback):
         return await_coroutine(type(self.async_contextmanager).__aexit__(self.async_contextmanager, exc_type, exc_value, traceback))
 
+contextlib.AbstractContextManager.register(contextmanager)  # @UndefinedVariable
+
 
 class asynccontextmanager:
-    def __init__(self, contextmanager):
-        self.contextmanager = contextmanager
-        
-    async def __aenter__(self):
-        return await new_generator_coroutine(type(self.contextmanager).__enter__(self.contextmanager))
-    
-    async def __aexit__(self, exc_type, exc_value, traceback):
-        return await new_generator_coroutine(type(self.contextmanager).__exit__(self.contextmanager, exc_type, exc_value, traceback))
+    """An asynchronous context manager, that delegates to a *with* statement context manager.
 
+    This asynchronous context manager delegates to a synchronous *with* statement context manager
+    to actually manage the context.
+    """
+
+    def __init__(self, contextmanager):
+        """
+        :param contextmanager: the context manager to delegate to
+        """
+        self.contextmanager = contextmanager
+
+    async def __aenter__(self):
+        return await new_generator_coroutine(type(self.contextmanager).__enter__, self.contextmanager)
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return await new_generator_coroutine(type(self.contextmanager).__exit__, self.contextmanager, exc_type, exc_value, traceback)
+
+contextlib.AbstractAsyncContextManager.register(asynccontextmanager)  # @UndefinedVariable
 
 
 def as_coroutinefunction(callable_):
-    """A decorator for a plain old callable
+    """Create a *coroutine function* from a normal callable.
+
+    This function is a *decorator* that can be used to define a
+    *coroutine function* from any normal function, method or other
+    callable.
+
+    :param Callable callable_: the callable to be decorated
+    :returns: a coroutine function
     """
     @functools.wraps(callable_)
     async def coro(*args, **kwargs):
@@ -242,16 +331,31 @@ def as_coroutinefunction(callable_):
 
 
 def new_coroutine(callable_, *args, **kwargs):
+    """Run any Python callable as coroutine.
+
+    Same as :func:`new_generator_coroutine`, but return a coroutine
+    created by a *async def* coroutine function.
+    """
     return as_coroutinefunction(callable_)(*args, **kwargs)
 
 
 def await_coroutine(coroutine):
-    """await the given coroutine"""
-    if not _is_as_coroutine_tasklet.get():
+    """await a coroutine
+
+    A normal function (or method or other callable) may use this function
+    to await an awaitable object, if the function has been directly or
+    indirectly called by :func:`new_generator_coroutine`.
+
+    :param coroutine: the coroutine to be awaited
+    :type coroutine: :class:`~collections.abc.Coroutine` or :class:`~collections.abc.Generator`
+    :returns: the value returned by *coroutine*
+    :raises RuntimeError: if called from outside of :func:`new_generator_coroutine`.
+    """
+    if not _new_generator_coroutine.runcount:
         raise RuntimeError("Can't call await_coroutine from tasklet " + repr(stackless.current))
     if not isinstance(coroutine, (collections.abc.Coroutine, collections.abc.Generator)):
         raise TypeError("argument is neither a coroutine nor a generator")
-    return stackless.schedule_remove(("await", coroutine))
+    return stackless.schedule_remove((_AWAIT, coroutine))
 
 
 

@@ -15,3 +15,5 @@ This Python module all sort of utility functions to
  * create a normal context manager from an asynchronous context manager
  
 This code requires Stackless Python 3.7.6 or any later version.
+
+Homepage: https://github.com/akruis/slp_coroutine/

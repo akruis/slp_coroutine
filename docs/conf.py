@@ -57,3 +57,21 @@ html_static_path = ['_static']
 # process. You may only specify the root package of the dependencies themselves
 # and omit the sub-modules:
 autodoc_mock_imports = ["stackless"]
+
+# This value selects what content will be inserted into the main body of an
+# autoclass directive. The possible values are:
+#
+# "class"
+#     Only the class’ docstring is inserted. This is the default. You can still
+#     document __init__ as a separate method using automethod or the members
+#     option to autoclass.
+#
+# "both"
+#     Both the class’ and the __init__ method’s docstring are concatenated and
+#     inserted.
+# "init"
+#     Only the __init__ method’s docstring is inserted.
+#
+# If the class has no __init__ method or if the __init__ method’s docstring is
+# empty, but the class has a __new__ method’s docstring, it is used instead.
+autoclass_content = "both"

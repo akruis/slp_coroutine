@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this library; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Suite 500, Boston, MA  02110-1335  USA.
+import slp_coroutine
 
 '''
 Tests for spl_asyncio
@@ -25,9 +26,10 @@ import types
 import inspect
 import stackless
 import contextvars
+import contextlib
 
 from slp_coroutine import *
-from slp_coroutine import _is_as_coroutine_tasklet
+from slp_coroutine import _new_generator_coroutine
 
 test_context_var = contextvars.ContextVar('my_context_var')
 
@@ -370,27 +372,87 @@ class Test(unittest.TestCase):
             run_async(coro())
         self.assertEqual(result, [0, 36, 36, cm.exception])
 
+    def test_contextmanager_1(self):
+        @contextlib.asynccontextmanager
+        async def ascmgr():
+            yield 1
+
+        context_manager = slp_coroutine.contextmanager(ascmgr())
+        self.assertIsInstance(context_manager, contextlib.AbstractContextManager)
+        self.assertTrue(callable(context_manager.__enter__))
+        self.assertTrue(callable(context_manager.__exit__))
+
+    def test_contextmanager_2(self):
+
+        steps = []
+        @contextlib.asynccontextmanager
+        async def ascmgr():
+            steps.append(1)
+            try:
+                yield 2
+            finally:
+                steps.append(3)
+
+        def func():
+            context_manager = slp_coroutine.contextmanager(ascmgr())
+            with context_manager as value:
+                self.assertListEqual(steps, [1])
+                steps.append((value,4))
+
+        result = run_async(new_coroutine(func))
+        self.assertListEqual(steps, [1, (2,4), 3])
+        self.assertEqual(result, ([], None))
+
+    def test_asynccontextmanager_1(self):
+        @contextlib.contextmanager
+        def cmgr():
+            yield 1
+
+        context_manager = slp_coroutine.asynccontextmanager(cmgr())
+        self.assertIsInstance(context_manager, contextlib.AbstractAsyncContextManager)
+        self.assertTrue(callable(context_manager.__aenter__))
+        self.assertTrue(callable(context_manager.__aexit__))
+
+    def test_asynccontextmanager_2(self):
+        steps = []
+        @contextlib.contextmanager
+        def cmgr():
+            steps.append(1)
+            try:
+                yield 2
+            finally:
+                steps.append(3)
+
+        async def func():
+            context_manager = slp_coroutine.asynccontextmanager(cmgr())
+            async with context_manager as value:
+                self.assertListEqual(steps, [1])
+                steps.append((value,4))
+
+        result = run_async(func())
+        self.assertListEqual(steps, [1, (2,4), 3])
+        self.assertEqual(result, ([], None))
+
     def test_context_1(self):
-        
+
         @types.coroutine
         def bar():
-            return _is_as_coroutine_tasklet.get(), test_context_var.get()
+            return _new_generator_coroutine.runcount, test_context_var.get()
             yield
 
         def foo():
             token = test_context_var.set('test_context_1_foo')
             try:
-                return await_coroutine(bar()), _is_as_coroutine_tasklet.get()
+                return await_coroutine(bar()), _new_generator_coroutine.runcount
             finally:
                 test_context_var.reset(token)
 
-        self.assertFalse(_is_as_coroutine_tasklet.get())
+        self.assertFalse(_new_generator_coroutine.runcount)
         sentinel = object()
         self.assertIs(test_context_var.get(sentinel), sentinel)
         coro = new_coroutine(foo)
         result = run_async(coro)
-        self.assertEqual(result, ([], ((False, 'test_context_1_foo'), True)))
-        
+        self.assertEqual(result, ([], ((0, 'test_context_1_foo'), 1)))
 
 
 if __name__ == "__main__":
