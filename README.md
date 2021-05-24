@@ -16,4 +16,12 @@ This Python module all sort of utility functions to
  
 This code requires Stackless Python 3.7.6 or any later version.
 
-Homepage: https://github.com/akruis/slp_coroutine/
+Documentation: https://slp-coroutine.readthedocs.io/
+
+Bug Tracker: https://github.com/akruis/slp_coroutine/issues
+
+## Changelog
+
+ * 0.0.1: Initial release
+ * 0.0.2: Add the documentation to the source archive
+
